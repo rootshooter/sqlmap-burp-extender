@@ -12,7 +12,7 @@ import java.util.concurrent.*;
 import java.util.regex.*;
 import java.util.concurrent.TimeUnit;
 
-public class SqlmapExtension implements IBurpExtender, IContextMenuFactory, ITab {
+public class SqlmapExtension implements IBurpExtender, IContextMenuFactory, ITab, IMessageEditorController {
     private IBurpExtenderCallbacks callbacks;
     private IExtensionHelpers helpers;
     private PrintWriter stdout;
@@ -29,6 +29,10 @@ public class SqlmapExtension implements IBurpExtender, IContextMenuFactory, ITab
     private JComboBox<String> testLevelCombo;
     private JTable resultsTable;
     private DefaultTableModel resultsTableModel;
+    private List<IHttpRequestResponse> resultsMessages;
+    
+    private IMessageEditor requestViewer;
+    private IHttpRequestResponse currentlyDisplayedItem;
     
     private ExecutorService executorService;
     private String sqlmapPath = "sqlmap";
@@ -51,6 +55,7 @@ public class SqlmapExtension implements IBurpExtender, IContextMenuFactory, ITab
         callbacks.setExtensionName("SQLMap Scanner");
         
         executorService = Executors.newFixedThreadPool(3);
+        resultsMessages = new ArrayList<>();
         
         // Load saved settings
         loadSettings();
@@ -300,34 +305,37 @@ public class SqlmapExtension implements IBurpExtender, IContextMenuFactory, ITab
         };
         resultsTable = new JTable(resultsTableModel);
         resultsTable.setAutoResizeMode(JTable.AUTO_RESIZE_ALL_COLUMNS);
+        resultsTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         
-        // Add double-click handler to view full output
-        resultsTable.addMouseListener(new java.awt.event.MouseAdapter() {
-            @Override
-            public void mouseClicked(java.awt.event.MouseEvent evt) {
-                if (evt.getClickCount() == 2) {
-                    int row = resultsTable.getSelectedRow();
-                    if (row >= 0) {
-                        String url = resultsTable.getValueAt(row, 1).toString();
-                        String status = resultsTable.getValueAt(row, 3).toString();
-                        JOptionPane.showMessageDialog(mainPanel,
-                            "URL: " + url + "\n" +
-                            "Status: " + status + "\n\n" +
-                            "Full SQLMap output is available in Burp's Output tab.\n" +
-                            "Enable 'Verbose Mode' for detailed logs.",
-                            "Scan Details",
-                            JOptionPane.INFORMATION_MESSAGE);
-                    }
+        // Add selection listener to display request/response
+        resultsTable.getSelectionModel().addListSelectionListener(e -> {
+            if (!e.getValueIsAdjusting()) {
+                int selectedRow = resultsTable.getSelectedRow();
+                if (selectedRow >= 0 && selectedRow < resultsMessages.size()) {
+                    displayRequestResponse(resultsMessages.get(selectedRow));
                 }
             }
         });
         
         JScrollPane resultsScrollPane = new JScrollPane(resultsTable);
-        resultsScrollPane.setBorder(BorderFactory.createTitledBorder("Scan Results"));
+        resultsScrollPane.setBorder(BorderFactory.createTitledBorder("Scan Results (Click to view tested request)"));
+        
+        // Create message editor for request only (with controller for context menu)
+        requestViewer = callbacks.createMessageEditor(this, false);
+        JPanel requestPanel = new JPanel(new BorderLayout());
+        requestPanel.setBorder(BorderFactory.createTitledBorder("Tested Request"));
+        requestPanel.add(requestViewer.getComponent(), BorderLayout.CENTER);
+        
+        // Split pane with results table on top and request viewer on bottom
+        JSplitPane splitPane = new JSplitPane(JSplitPane.VERTICAL_SPLIT);
+        splitPane.setTopComponent(resultsScrollPane);
+        splitPane.setBottomComponent(requestPanel);
+        splitPane.setResizeWeight(0.4); // Give more space to request viewer
+        splitPane.setDividerLocation(0.4);
         
         // Add components to main panel
         mainPanel.add(configPanel, BorderLayout.NORTH);
-        mainPanel.add(resultsScrollPane, BorderLayout.CENTER);
+        mainPanel.add(splitPane, BorderLayout.CENTER);
         
         // Buttons Panel
         JPanel buttonsPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT));
@@ -343,13 +351,24 @@ public class SqlmapExtension implements IBurpExtender, IContextMenuFactory, ITab
         buttonsPanel.add(saveSettingsButton);
         
         JButton clearButton = new JButton("Clear Results");
-        clearButton.addActionListener(e -> resultsTableModel.setRowCount(0));
+        clearButton.addActionListener(e -> {
+            resultsTableModel.setRowCount(0);
+            resultsMessages.clear();
+            requestViewer.setMessage(new byte[0], true);
+        });
         buttonsPanel.add(clearButton);
         
         mainPanel.add(buttonsPanel, BorderLayout.SOUTH);
         
         // Load saved UI settings
         loadUISettings();
+    }
+    
+    private void displayRequestResponse(IHttpRequestResponse message) {
+        if (message != null) {
+            currentlyDisplayedItem = message;
+            requestViewer.setMessage(message.getRequest(), true);
+        }
     }
     
     private void browseSqlmapPath() {
@@ -918,9 +937,6 @@ public class SqlmapExtension implements IBurpExtender, IContextMenuFactory, ITab
             command.add("--flush-session");
         }
         
-        // Additional options - remove technique to let SQLMap use its defaults
-        command.add("--answers=crack=N");
-        
         // Parse additional arguments
         String additionalArgs = additionalArgsArea.getText().trim();
         if (!additionalArgs.isEmpty()) {
@@ -968,6 +984,7 @@ public class SqlmapExtension implements IBurpExtender, IContextMenuFactory, ITab
                     finalInjectionType,
                     finalDbms
                 });
+                resultsMessages.add(message);
             });
             
             // Create scanner issue
@@ -990,6 +1007,7 @@ public class SqlmapExtension implements IBurpExtender, IContextMenuFactory, ITab
                     "NONE DETECTED",
                     "-"
                 });
+                resultsMessages.add(message);
             });
             
             stdout.println("[-] No SQL injection found in: " + url.toString());
@@ -1004,6 +1022,7 @@ public class SqlmapExtension implements IBurpExtender, IContextMenuFactory, ITab
                     "Check logs",
                     "-"
                 });
+                resultsMessages.add(message);
             });
             
             stdout.println("[-] Scan completed for: " + url.toString() + " (check detailed logs)");
@@ -1128,6 +1147,23 @@ public class SqlmapExtension implements IBurpExtender, IContextMenuFactory, ITab
     @Override
     public Component getUiComponent() {
         return mainPanel;
+    }
+    
+    // IMessageEditorController implementation
+    // These methods provide context for the message editor, enabling right-click options
+    @Override
+    public IHttpService getHttpService() {
+        return currentlyDisplayedItem != null ? currentlyDisplayedItem.getHttpService() : null;
+    }
+    
+    @Override
+    public byte[] getRequest() {
+        return currentlyDisplayedItem != null ? currentlyDisplayedItem.getRequest() : null;
+    }
+    
+    @Override
+    public byte[] getResponse() {
+        return currentlyDisplayedItem != null ? currentlyDisplayedItem.getResponse() : null;
     }
     
     // Custom Scanner Issue Implementation
